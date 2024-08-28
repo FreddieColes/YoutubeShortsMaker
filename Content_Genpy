@@ -1,0 +1,368 @@
+import sys
+import traceback
+import subprocess
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips, CompositeVideoClip, TextClip
+import os
+import glob
+from pyt2s.services import stream_elements
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from google.auth.exceptions import RefreshError
+from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton, QTextEdit, QDialog, QLineEdit, QDialogButtonBox
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl
+from PyQt5.QtGui import QDesktopServices
+import google_auth_oauthlib.flow
+
+
+# Replace this with the actual path to your custom action font
+CUSTOM_FONT_PATH = r"C:\src\YoutubeShortsMaker\Fredyossa-Regular.ttf"
+
+class VideoGenerationThread(QThread):
+    update_signal = pyqtSignal(str)
+
+    def run(self):
+        try:
+            image_paths = self.run_image_script()
+            if not image_paths:
+                return
+            
+            lore_text = self.run_lore_script()
+            if not lore_text:
+                return
+            
+            self.create_video_with_voiceover(image_paths, lore_text)
+
+        except Exception as e:
+            self.update_signal.emit(f"An error occurred: {str(e)}")
+
+    def run_image_script(self):
+        self.update_signal.emit("Running image generation script...")
+        result = subprocess.run(["python", "image_generation_script.py"], capture_output=True, text=True)
+        self.update_signal.emit(result.stdout)
+        if result.returncode != 0:
+            self.update_signal.emit(f"Error in image generation: {result.stderr}")
+            return None
+        
+        image_paths = sorted(glob.glob("lotr_generated_image_*.png"))
+        
+        if not image_paths:
+            self.update_signal.emit("No images were generated.")
+            return None
+        
+        return image_paths
+
+    def run_lore_script(self):
+        self.update_signal.emit("Running lore generation script...")
+        result = subprocess.run(["python", "lore_generation_script.py"], capture_output=True, text=True)
+        if result.returncode != 0:
+            self.update_signal.emit(f"Error in lore generation: {result.stderr}")
+            return None
+        lore = result.stdout.strip()
+        lore_start = lore.find("Generated Lore:")
+        if lore_start != -1:
+            lore = lore[lore_start + len("Generated Lore:"):].strip()
+        return lore
+
+    def generate_male_voice(self, text, output_file="full_voiceover.mp3"):
+        try:
+            # Use Russell voice as it's a male voice
+            data = stream_elements.requestTTS(text, stream_elements.Voice.Russell.value)
+            
+            with open(output_file, '+wb') as file:
+                file.write(data)
+            
+            self.update_signal.emit(f"Voice generated and saved as {output_file}")
+        except Exception as e:
+            self.update_signal.emit(f"Error generating voice: {str(e)}")
+
+    def create_video_with_voiceover(self, image_paths, lore_text):
+        img = cv2.imread(image_paths[0])
+        height, width, _ = img.shape
+        
+        self.update_signal.emit("Generating male voice...")
+        self.generate_male_voice(lore_text)
+        
+        audio = AudioFileClip("full_voiceover.mp3")
+        audio_duration = audio.duration
+        
+        font_size = 60  # Reduced font size for better fit
+        custom_font = ImageFont.truetype(CUSTOM_FONT_PATH, font_size)
+        
+        words = lore_text.split()
+        chunks = [' '.join(words[i:i+8]) for i in range(0, len(words), 8)]
+        
+        duration_per_chunk = audio_duration / len(chunks)
+        
+        video_clips = []
+        
+        for chunk_index, chunk in enumerate(chunks):
+            self.update_signal.emit(f"Processing chunk {chunk_index + 1} of {len(chunks)}...")
+            img = cv2.imread(image_paths[chunk_index % len(image_paths)])
+            pil_image = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            draw = ImageDraw.Draw(pil_image)
+            
+            # Wrap text
+            lines = []
+            line = []
+            for word in chunk.split():
+                line.append(word)
+                if draw.textlength(' '.join(line), font=custom_font) > width - 100:
+                    lines.append(' '.join(line[:-1]))
+                    line = [word]
+            lines.append(' '.join(line))
+            
+            # Calculate text box dimensions
+            line_height = font_size * 1.2
+            text_height = len(lines) * line_height
+            box_height = text_height + 40  # Add padding
+            
+            # Create semi-transparent black box
+            box_top = height - box_height
+            box = Image.new('RGBA', (width, int(box_height)), (0, 0, 0, 180))
+            pil_image.paste(box, (0, int(box_top)), box)
+            
+            # Draw text
+            y_text = box_top + 20
+            for line in lines:
+                draw.text((50, y_text), line, font=custom_font, fill=(255, 255, 255))
+                y_text += line_height
+            
+            frame = np.array(pil_image)
+            clip = ImageClip(frame).set_duration(duration_per_chunk)
+            video_clips.append(clip)
+        
+        self.update_signal.emit("Concatenating video clips...")
+        final_video = concatenate_videoclips(video_clips).set_duration(audio_duration)
+        final_video = final_video.set_audio(audio)
+        
+        self.update_signal.emit("Writing final video file...")
+        final_video.write_videofile("fantasy_video_with_voiceover.mp4", codec="libx264", audio_codec="aac", fps=30)
+        
+        os.remove("full_voiceover.mp3")
+        
+        self.update_signal.emit("Video created successfully as 'fantasy_video_with_voiceover.mp4'.")
+
+class OAuthDialog(QDialog):
+    def __init__(self, auth_url, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("YouTube Authorization")
+        self.setGeometry(100, 100, 400, 200)
+
+        layout = QVBoxLayout()
+
+        info_label = QLabel(f"Please visit this URL to authorize the application:\n{auth_url}")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        open_browser_button = QPushButton("Open in Browser")
+        open_browser_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(auth_url)))
+        layout.addWidget(open_browser_button)
+
+        self.code_input = QLineEdit()
+        layout.addWidget(QLabel("Enter the authorization code:"))
+        layout.addWidget(self.code_input)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+        self.setLayout(layout)
+
+    def get_code(self):
+        return self.code_input.text()
+
+class FantasyContentGenerator(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Fantasy Content Generator")
+        self.setGeometry(100, 100, 800, 600)
+
+        main_widget = QWidget()
+        main_layout = QVBoxLayout()
+        main_widget.setLayout(main_layout)
+        self.setCentralWidget(main_widget)
+
+        self.tab_widget = QTabWidget()
+        main_layout.addWidget(self.tab_widget)
+
+        self.create_shorts_tab()
+        self.create_blogs_tab()
+        self.create_videos_tab()
+        self.create_books_tab()
+
+    def create_shorts_tab(self):
+        shorts_tab = QWidget()
+        shorts_layout = QVBoxLayout()
+        shorts_tab.setLayout(shorts_layout)
+
+        shorts_options = ["LOTR", "DBZ", "CartoonNetwork", "Motivation", "GOT"]
+        dropdown_layout = QHBoxLayout()
+        dropdown_label = QLabel("Select theme:")
+        self.shorts_dropdown = QComboBox()
+        self.shorts_dropdown.addItems(shorts_options)
+        dropdown_layout.addWidget(dropdown_label)
+        dropdown_layout.addWidget(self.shorts_dropdown)
+        shorts_layout.addLayout(dropdown_layout)
+
+        generate_button = QPushButton("Generate Short")
+        generate_button.clicked.connect(self.generate_short)
+        shorts_layout.addWidget(generate_button)
+
+        upload_button = QPushButton("Upload to YouTube Shorts")
+        upload_button.clicked.connect(self.upload_to_youtube)
+        shorts_layout.addWidget(upload_button)
+
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        shorts_layout.addWidget(self.log_output)
+
+        self.tab_widget.addTab(shorts_tab, "Shorts")
+
+    def create_blogs_tab(self):
+        blogs_tab = QWidget()
+        self.tab_widget.addTab(blogs_tab, "Blogs")
+
+    def create_videos_tab(self):
+        videos_tab = QWidget()
+        self.tab_widget.addTab(videos_tab, "Videos")
+
+    def create_books_tab(self):
+        books_tab = QWidget()
+        self.tab_widget.addTab(books_tab, "Books")
+
+    def generate_short(self):
+        selected_theme = self.shorts_dropdown.currentText()
+        self.log_output.clear()
+        self.log_output.append(f"Generating short for theme: {selected_theme}")
+
+        self.update_image_script(selected_theme)
+        self.update_lore_script(selected_theme)
+
+        self.thread = VideoGenerationThread()
+        self.thread.update_signal.connect(self.update_log)
+        self.thread.start()
+
+    def update_log(self, message):
+        self.log_output.append(message)
+
+    def update_image_script(self, theme):
+        prompts = {
+            "LOTR": "A majestic scene from Lord of the Rings, featuring hobbits, elves, and a grand castle in a lush forest",
+            "DBZ": "An intense battle scene from Dragon Ball Z with powerful energy beams and flying warriors",
+            "CartoonNetwork": "A colorful crossover scene featuring popular Cartoon Network characters in a playful setting",
+            "Motivation": "An inspiring landscape with a motivational quote overlaid, depicting triumph over adversity",
+            "GOT": "A dramatic scene from Game of Thrones with dragons, castles, and characters in a medieval fantasy setting"
+        }
+
+        with open("image_generation_script.py", "r") as file:
+            content = file.read()
+
+        new_prompt = prompts.get(theme, prompts["LOTR"])
+        updated_content = content.replace(
+            'prompt = "A majestic scene from Lord of the Rings, featuring hobbits, elves, and a grand castle in a lush forest"',
+            f'prompt = "{new_prompt}"'
+        )
+
+        with open("image_generation_script.py", "w") as file:
+            file.write(updated_content)
+
+    def update_lore_script(self, theme):
+        prompts = {
+            "LOTR": "Generate a detailed piece of Lord of the Rings lore. Include information about characters, places, or events from Middle-earth.",
+            "DBZ": "Generate a detailed piece of Dragon Ball Z lore. Include information about characters, power levels, or epic battles.",
+            "CartoonNetwork": "Generate a fun crossover story featuring characters from different Cartoon Network shows.",
+            "Motivation": "Generate an inspiring short story with a powerful motivational message.",
+            "GOT": "Generate a detailed piece of Game of Thrones lore. Include information about houses, characters, or events from Westeros."
+        }
+
+        with open("lore_generation_script.py", "r") as file:
+            content = file.read()
+
+        new_prompt = prompts.get(theme, prompts["LOTR"])
+        updated_content = content.replace(
+            'prompt = """Generate a detailed piece of Lord of the Rings lore. \n    Include information about characters, places, or events from Middle-earth. \n    The lore should be about 50-75 words long and capture the essence of epic fantasy style of Tolkien\'s world."""',
+            f'prompt = """{new_prompt}\n    The lore should be about 50-75 words long and capture the essence of the chosen theme."""'
+        )
+
+        with open("lore_generation_script.py", "w") as file:
+            file.write(updated_content)
+
+    def upload_to_youtube(self):
+        self.log_output.append("Initiating YouTube upload...")
+        
+        try:
+            # Check if the video file exists
+            video_path = 'fantasy_video_with_voiceover.mp4'
+            if not os.path.exists(video_path):
+                raise FileNotFoundError(f"Video file not found: {video_path}")
+
+            # Set up the OAuth 2.0 flow
+            client_secrets_file = "client_secret.json"
+            if not os.path.exists(client_secrets_file):
+                raise FileNotFoundError(f"Client secrets file not found: {client_secrets_file}")
+
+            flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(
+                client_secrets_file,
+                scopes=['https://www.googleapis.com/auth/youtube.upload']
+            )
+
+            # Run the OAuth flow
+            flow.redirect_uri = 'urn:ietf:wg:oauth:2.0:oob'
+            auth_url, _ = flow.authorization_url(prompt='consent')
+            
+            dialog = OAuthDialog(auth_url, self)
+            if dialog.exec_() == QDialog.Accepted:
+                code = dialog.get_code()
+                flow.fetch_token(code=code)
+                credentials = flow.credentials
+            else:
+                self.log_output.append("Authorization cancelled.")
+                return
+
+            # Build the YouTube API client
+            youtube = build('youtube', 'v3', credentials=credentials)
+
+            # Prepare the video upload
+            request_body = {
+                'snippet': {
+                    'title': 'My Fantasy Short',
+                    'description': 'A short video generated with AI',
+                    'tags': ['fantasy', 'AI-generated'],
+                    'categoryId': '22'  # People & Blogs category
+                },
+                'status': {
+                    'privacyStatus': 'private',  # or 'public' if you want it public immediately
+                    'selfDeclaredMadeForKids': False,
+                }
+            }
+
+            # Execute the upload
+            media_file = MediaFileUpload(video_path)
+            request = youtube.videos().insert(
+                part='snippet,status',
+                body=request_body,
+                media_body=media_file
+            )
+            response = request.execute()
+
+            self.log_output.append(f"Video uploaded successfully. Video ID: {response['id']}")
+
+        except FileNotFoundError as e:
+            self.log_output.append(f"File not found error: {str(e)}")
+        except RefreshError:
+            self.log_output.append("Error: Failed to refresh the OAuth 2.0 credentials. Please try again.")
+        except Exception as e:
+            self.log_output.append(f"An unexpected error occurred during upload: {str(e)}")
+            self.log_output.append("Traceback:")
+            self.log_output.append(traceback.format_exc())
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = FantasyContentGenerator()
+    window.show()
+    sys.exit(app.exec_())
