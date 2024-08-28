@@ -1,0 +1,31 @@
+import google.generativeai as genai
+import os
+
+# Set up the API key
+GOOGLE_API_KEY = "APIKey"  # Replace with your actual API key
+genai.configure(api_key=GOOGLE_API_KEY)
+
+def generate_lotr_lore():
+    # Set up the model
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    # Set up the prompt
+    prompt = """Generate a detailed piece of Lord of the Rings lore. Include information about characters, places, or events from Middle-earth.
+    The lore should be about 50-75 words long and capture the essence of the chosen theme."""
+
+    # Generate the content
+    response = model.generate_content(prompt)
+    
+    return response.text
+
+def main():
+    print("Generating Lord of the Rings lore using Gemini 1.5 Flash...")
+    try:
+        lore = generate_lotr_lore()
+        print("\nGenerated Lore:")
+        print(lore)
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+
+if __name__ == "__main__":
+    main()
