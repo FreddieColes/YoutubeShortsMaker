@@ -1,0 +1,157 @@
+import subprocess
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import time
+from moviepy.editor import ImageClip, VideoFileClip, AudioFileClip, CompositeVideoClip, concatenate_videoclips
+import os
+import glob
+import pyttsx3
+
+# Replace this with the path to your custom action font
+CUSTOM_FONT_PATH = "C:\src\YoutubeShortsMaker\Fredyossa-Regular.ttf"
+
+def run_image_script():
+    print("Running image generation script...")
+    result = subprocess.run(["python", "image_generation_script.py"], capture_output=True, text=True)
+    print(result.stdout)
+    if result.returncode != 0:
+        print(f"Error in image generation: {result.stderr}")
+        return None
+    
+    image_paths = sorted(glob.glob("lotr_generated_image_*.png"))
+    
+    if not image_paths:
+        print("No images were generated.")
+        return None
+    
+    return image_paths
+
+def run_lore_script():
+    print("Running lore generation script...")
+    result = subprocess.run(["python", "lore_generation_script.py"], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Error in lore generation: {result.stderr}")
+        return None
+    lore = result.stdout.strip()
+    lore_start = lore.find("Generated Lore:")
+    if lore_start != -1:
+        lore = lore[lore_start + len("Generated Lore:"):].strip()
+    return lore
+
+def generate_male_voice(text, output_file="full_voiceover.mp3"):
+    engine = pyttsx3.init()
+    voices = engine.getProperty('voices')
+    
+    # Try to find Microsoft George voice
+    george_voice = next((voice for voice in voices if "george" in voice.name.lower()), None)
+    
+    if george_voice:
+        engine.setProperty('voice', george_voice.id)
+    else:
+        # If George is not available, use the first male voice
+        male_voice = next((voice for voice in voices if "male" in voice.gender.lower()), None)
+        if male_voice:
+            engine.setProperty('voice', male_voice.id)
+        else:
+            print("No male voice found. Using default voice.")
+    
+    engine.save_to_file(text, output_file)
+    engine.runAndWait()
+
+def create_video_with_voiceover(image_paths, lore_text):
+    img = cv2.imread(image_paths[0])
+    height, width, _ = img.shape
+    
+    # Generate audio with male voice
+    generate_male_voice(lore_text)
+    
+    audio = AudioFileClip("full_voiceover.mp3")
+    audio_duration = audio.duration
+    
+    # Load custom font with a larger size
+    font_size = 120  # Increased font size
+    custom_font = ImageFont.truetype(CUSTOM_FONT_PATH, font_size)
+    
+    words = lore_text.split()
+    chunks = [' '.join(words[i:i+8]) for i in range(0, len(words), 8)]  # Reduced words per chunk
+    
+    duration_per_chunk = audio_duration / len(chunks)
+    
+    video_clips = []
+    
+    for chunk_index, chunk in enumerate(chunks):
+        # Load the image
+        img = cv2.imread(image_paths[chunk_index % len(image_paths)])
+        pil_image = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(pil_image)
+        
+        # Split chunk into lines that fit the screen
+        lines = chunk.split()
+        current_line = ""
+        formatted_lines = []
+        for word in lines:
+            test_line = current_line + " " + word if current_line else word
+            text_width = draw.textlength(test_line, font=custom_font)
+            if text_width <= width - 160:  # Increased padding
+                current_line = test_line
+            else:
+                formatted_lines.append(current_line)
+                current_line = word
+        if current_line:
+            formatted_lines.append(current_line)
+        
+        # Calculate total text height
+        line_height = font_size * 1.2
+        total_height = len(formatted_lines) * line_height
+        
+        # Calculate starting Y position to place text lower on the screen
+        y_start = height - total_height - 100  # 100 pixels from the bottom
+        
+        # Create a semi-transparent black box for the text background
+        box_padding = 40
+        box_height = total_height + 2 * box_padding
+        box_top = y_start - box_padding
+        box = Image.new('RGBA', (width, int(box_height)), (0, 0, 0, 180))
+        pil_image.paste(box, (0, int(box_top)), box)
+        
+        for i, line in enumerate(formatted_lines):
+            y = int(y_start + i * line_height)
+            x = 80  # Increased left padding
+            
+            # Draw text with custom font in white color
+            draw.text((x, y), line.strip(), font=custom_font, fill=(255, 255, 255))
+        
+        # Convert PIL Image to numpy array
+        frame = np.array(pil_image)
+        
+        # Create an ImageClip from the frame
+        clip = ImageClip(frame).set_duration(duration_per_chunk)
+        
+        video_clips.append(clip)
+    
+    # Concatenate all video clips
+    final_video = concatenate_videoclips(video_clips).set_duration(audio_duration)
+    final_video = final_video.set_audio(audio)
+    
+    # Write the final video file
+    final_video.write_videofile("fantasy_video_with_voiceover.mp4", codec="libx264", audio_codec="aac", fps=30)
+    
+    # Clean up temporary files
+    os.remove("full_voiceover.mp3")
+    
+    print("Video created successfully as 'fantasy_video_with_voiceover.mp4'.")
+
+def main():
+    image_paths = run_image_script()
+    if not image_paths:
+        return
+    
+    lore_text = run_lore_script()
+    if not lore_text:
+        return
+    
+    create_video_with_voiceover(image_paths, lore_text)
+
+if __name__ == "__main__":
+    main()
